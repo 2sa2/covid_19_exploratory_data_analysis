@@ -1,0 +1,391 @@
+---
+title: "COVID-19: An Exploratory Data Analysis"
+author: "Eric Tusa"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(scales)
+library(rvest)
+library(usmap)
+```
+
+Let's load the relevant data sets.
+```{r}
+# New York Times COVID-19 data sets
+us_2020 <- "https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties-2020.csv"
+us_2021 <- "https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties-2021.csv"
+us_2022 <- "https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties-2022.csv"
+us_2023 <- "https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties-2023.csv"
+
+# Johns Hopkins CSSEGISandData data sets
+csse_global_deaths <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_global.csv"
+csse_global_cases <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_global.csv"
+csse_us_deaths <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_US.csv"
+csse_us_cases <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_US.csv"
+
+# provided by CU Boulder on Coursera's R Programming Capstone Project course
+us_pop_estimates <- "https://raw.githubusercontent.com/2sa2/covid_19_exploratory_data_analysis/main/data/fips_population_estimates.csv"
+us_state_pop_estimates <- "https://raw.githubusercontent.com/2sa2/covid_19_exploratory_data_analysis/main/data/NST-EST2023-POP.csv"
+global_pop_estimates <- "https://raw.githubusercontent.com/2sa2/covid_19_exploratory_data_analysis/main/data/global_population_estimates.csv"
+
+relevant_files <- c(us_2020, us_2021, us_2022, us_2023, csse_global_deaths, csse_global_cases, csse_us_deaths, csse_us_cases, us_pop_estimates, us_state_pop_estimates, global_pop_estimates)
+
+if(!file.exists("data")) {
+  dir.create("data")
+}
+
+download_file <- function(file_link) {
+  if (!file.exists(file_link)) {
+    download.file(file_link, destfile = str_glue("data/{file}", file = basename(file_link)), method = "curl")
+  }
+}
+
+for (file in relevant_files) {
+  if (!file.exists(str_glue("data/{file}", file = basename(file)))) {
+    download_file(file)
+  }
+}
+```
+
+Next, we'll get the data loaded and tidied.
+```{r}
+nyt_2020 <- read_csv("data/us-counties-2020.csv")
+nyt_2021 <- read_csv("data/us-counties-2021.csv")
+nyt_2022 <- read_csv("data/us-counties-2022.csv")
+nyt_2023 <- read_csv("data/us-counties-2023.csv")
+
+johns_hopkins_csse_global_deaths <- read_csv("data/time_series_covid19_deaths_global.csv")
+johns_hopkins_csse_global_cases <- read_csv("data/time_series_covid19_confirmed_global.csv")
+johns_hopkins_csse_us_deaths <- read_csv("data/time_series_covid19_deaths_US.csv")
+johns_hopkins_csse_us_cases <- read_csv("data/time_series_covid19_confirmed_US.csv")
+
+us_pop_est <- read_csv("data/fips_population_estimates.csv")
+us_state_pop_est <- read_csv("data/NST-EST2023-POP.csv", skip = 3) %>% 
+  rename(state = ...1) %>% tail(-5) %>% 
+  filter(!is.na(state)) %>% 
+  pivot_longer(matches("\\d{4}"), names_to = "year", values_to = "population_est") %>% 
+  mutate(state = str_remove(state, "."), year = as.integer(year)) 
+global_pop_est <- read_csv("data/global_population_estimates.csv")
+
+# New York Times data
+aggregate_nyt_data <- rbind(nyt_2020, nyt_2021, nyt_2022, nyt_2023)
+
+# Johns Hopkins US data
+# The idea with pivot_longer() for these data sets is to move columns representing individual dates into one column that represents the date variable
+johns_hopkins_csse_us_deaths <- johns_hopkins_csse_us_deaths %>% pivot_longer(matches("\\d{2}"), names_to = "date", values_to = "deaths") %>% mutate(date = as.Date(date,"%m/%d/%y"))
+johns_hopkins_csse_us_cases <- johns_hopkins_csse_us_cases %>% pivot_longer(matches("\\d{2}"), names_to = "date", values_to = "cases") %>% mutate(date = as.Date(date, "%m/%d/%y"))
+johns_hopkins_csse_us_joined <- johns_hopkins_csse_us_cases %>% left_join(johns_hopkins_csse_us_deaths %>% select(UID, date, deaths),
+                                                                          by = join_by(UID, date))
+# Johns Hopkins global data
+johns_hopkins_csse_global_deaths <- johns_hopkins_csse_global_deaths %>% pivot_longer(matches("\\d{2}"), names_to = "date", values_to = "deaths") %>% mutate(date = as.Date(date,"%m/%d/%y"))
+johns_hopkins_csse_global_cases <- johns_hopkins_csse_global_cases %>% pivot_longer(matches("\\d{2}"), names_to = "date", values_to = "cases") %>% mutate(date = as.Date(date,"%m/%d/%y"))
+johns_hopkins_csse_global_joined <- johns_hopkins_csse_global_cases %>% left_join(johns_hopkins_csse_global_deaths %>% select(`Province/State`, `Country/Region`, date, deaths), by = join_by(`Province/State`, `Country/Region`, date))
+```
+
+# COVID-19: United States
+Let's get a quick overview of case and death counts as of March 3, 2023 within the United States. It's important to note that aggregate functions like `sum()` do not work with missing data (NAs), so these missing values must be filtered out prior to using these functions.
+```{r}
+aggregate_nyt_data %>%
+  filter(date == max(date)) %>%
+  summarise(us_total_cases = sum(cases), us_total_deaths = sum(deaths, na.rm = TRUE)) # Puerto Rico is missing some data for the deaths column
+```
+Now, let's break down the total case and death counts by date within the United States.
+```{r}
+by_date <- aggregate_nyt_data %>% 
+  group_by(date) %>% 
+  summarise(total_cases = sum(cases),
+            total_deaths = sum(deaths, na.rm = TRUE))
+by_date
+
+by_date %>% ggplot(aes(x = date)) +
+  geom_line(aes(y = total_cases, color = "total_cases")) +
+  scale_y_continuous(labels = comma) +
+  theme(legend.position = "none")
+
+by_date %>% ggplot(aes(x = date)) +
+  geom_line(aes(y = total_deaths, color = "total_deaths")) +
+  scale_y_continuous(labels = comma) +
+  theme(legend.position = "none")
+```
+  
+One noticeable trend in both of these plots is that both the cases and deaths seem to have sharper increases near the end of both 2020 and 2021 going into the beginning of the following year. As one possible interpretation, this trend could be due to the increased convening of people with their families and friends around the thanksgiving and winter holidays while the virus's [reproduction number](https://wwwnc.cdc.gov/eid/article/25/1/17-1901_article) was still at a statistically significant level.
+  
+In order to get a better understanding of the rate at which the virus was spreading, we can look at the changes in the number of new cases and deaths over time. Let's first calculate the 1-day changes and the 7-day averages for new cases and deaths, then look at those same statistics per 100,000 people.
+  
+*1-day and 7-day averages*
+```{r}
+seven_day_avgs <- by_date %>%
+  mutate(delta_cases_1 = total_cases - lag(total_cases),
+         delta_deaths_1 = total_deaths - lag(total_deaths)) %>% 
+  mutate(delta_cases_7 = round((delta_cases_1 + lag(delta_cases_1, 1) + lag(delta_cases_1, 2) + lag(delta_cases_1, 3) + lag(delta_cases_1, 4) + lag(delta_cases_1, 5) + lag(delta_cases_1, 6)) / 7, 3),
+         delta_deaths_7 = round((delta_deaths_1 + lag(delta_deaths_1, 1) + lag(delta_deaths_1, 2) + lag(delta_deaths_1, 3) + lag(delta_deaths_1, 4) + lag(delta_deaths_1, 5) + lag(delta_deaths_1, 6)) / 7, 3))
+seven_day_avgs
+```
+  
+*1-day and 7-day averages per 100,000*
+```{r}
+us_pop_est_by_year <- us_pop_est %>% group_by(Year) %>% 
+  summarise(pop_estimate = sum(Estimate)) %>% 
+  add_row(Year = c(2022, 2023),
+          # manually add population estimates for 2022 and 2023 since fips_population_estimates.csv does not contain data for those years
+          #source: https://www.census.gov/popclock/
+          pop_estimate = c(334130076, 335888625))
+seven_day_avgs_per_100k <- seven_day_avgs %>% mutate(year = year(date)) %>% 
+  left_join(us_pop_est_by_year, by = join_by(year == Year)) %>% select(-year)
+
+# adds a new column to the input table calculating the input variable per 100,000 people
+calculate_per_100000 <- function(table, variable) {
+  table %>%
+    mutate(
+      "{{variable}}" := round({{ variable }} / pop_estimate * 100000, 3)
+    )
+}
+
+seven_day_avgs_per_100k <- calculate_per_100000(seven_day_avgs_per_100k, total_cases)
+seven_day_avgs_per_100k <- calculate_per_100000(seven_day_avgs_per_100k, total_deaths)
+seven_day_avgs_per_100k <- calculate_per_100000(seven_day_avgs_per_100k, delta_cases_1)
+seven_day_avgs_per_100k <- calculate_per_100000(seven_day_avgs_per_100k, delta_deaths_1)
+seven_day_avgs_per_100k <- calculate_per_100000(seven_day_avgs_per_100k, delta_cases_7)
+seven_day_avgs_per_100k <- calculate_per_100000(seven_day_avgs_per_100k, delta_deaths_7)
+
+seven_day_avgs_per_100k %>% select(-pop_estimate)
+
+seven_day_avgs_per_100k %>% ggplot(aes(x = date, y = delta_cases_7)) +
+  geom_smooth(se = FALSE) +
+  ylab("7-day average new cases per 100,000 people")
+
+seven_day_avgs_per_100k %>% ggplot(aes(x = date, y = delta_deaths_7)) +
+  geom_smooth(se = FALSE) +
+  ylab("7-day average new deaths per 100,000 people")
+```
+  
+As we can see in the above charts, rates for new cases and deaths tend to go up near the end of each year and go down near the middle of each year. However, rates stayed relatively low near the end of 2023. This could be attributed to a number of factors, including people taking precautions such as becoming vaccinated, mask use, and physical distancing to avoid infection in the first place, avoiding contact with other people if they were to become infected, and the virus itself mutating over time into different, possibly weaker variants.
+  
+Next, I'd like to explore some of the data at the state level. I'll first look at which states have the highest total cases.
+```{r}
+aggregate_nyt_data %>%
+  group_by(state, date) %>%
+  summarise(cases = sum(cases), deaths = sum(deaths), .groups = "drop") %>%
+  filter(date == max(date)) %>% 
+  arrange(desc(cases))
+```
+
+Let's figure out both cases and deaths per 100,000 people at the state level.
+```{r}
+state_data <- aggregate_nyt_data %>% 
+  # create a new column so joining can be matched on year
+  mutate(year = year(date)) %>% 
+  right_join(us_state_pop_est, by = join_by(state, year)) %>%
+  rename(state_pop_est = population_est)
+
+# use weighted averages since 2020 and 2023 don't have data for the full years
+year_weights <- as.integer(c(round(difftime("2020-12-31", "2020-01-20")), 365, 365, round(difftime("2023-03-23", "2022-12-31"))))
+
+state_per_100k_by_year <- state_data %>%
+  filter(date == "2020-12-31" | date == "2021-12-31" | date == "2022-12-31" | date == max(date)) %>% 
+  group_by(state, year, state_pop_est) %>% 
+  summarise(cases = sum(cases),
+            deaths = sum(deaths),
+            .groups = "drop") %>% 
+  mutate(cases_yearly = case_when(year == 2020 ~ cases,
+                           .default = cases - lag(cases)),
+         deaths_yearly = case_when(year == 2020 ~ deaths,
+                           .default = deaths - lag(deaths))) %>% 
+  mutate(cases_yearly_per_100k = round(cases_yearly / state_pop_est * 100000, 3),
+         deaths_yearly_per_100k = round(deaths_yearly / state_pop_est * 100000, 3)) %>% 
+  group_by(state) %>% 
+  summarise(cases_per_100k = weighted.mean(cases_yearly_per_100k, year_weights),
+            deaths_per_100k = weighted.mean(deaths_yearly_per_100k, year_weights)) %>% 
+  # removing Puerto Rico since it's missing some data for deaths
+  filter(state != "Puerto Rico")
+
+state_per_100k_by_year %>% arrange(desc(cases_per_100k))
+state_per_100k_by_year %>% arrange(desc(deaths_per_100k))
+
+state_colors <- setNames(rainbow(n = n_distinct(state_per_100k_by_year$state), alpha = 0.7), unique(state_per_100k_by_year$state))
+state_per_100k_by_year %>% ggplot(aes(x = reorder(state, -cases_per_100k), y = cases_per_100k, fill = state)) +
+  geom_col(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = state_colors) +
+  labs(x = "State", y = "Cases Per 100,000") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3))
+state_per_100k_by_year %>% ggplot(aes(x = reorder(state, -deaths_per_100k), y = deaths_per_100k, fill = state)) +
+  geom_col(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = state_colors) +
+  labs(x = "State", y = "Deaths Per 100,000") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3))
+```
+  
+I see a trend in the top 10 states in both the cases and deaths per 100,000 in terms of political party control within each respective state. Let's look into it further in terms of deaths.
+```{r}
+wiki_state_political_party_strength <- read_html("https://en.wikipedia.org/wiki/Political_party_strength_in_U.S._states")
+tables <- wiki_state_political_party_strength %>% html_table(fill = TRUE)
+party_strength <- tables[[3]] %>% filter(State %in% head(arrange(state_per_100k_by_year, desc(deaths_per_100k)), 10)$state) %>% 
+  summarise(dem_presidential_2020 = sum(`2020 presidentialelection` == "Democratic"),
+            rep_presidendial_2020 = sum(`2020 presidentialelection` == "Republican"),
+            dem_governor = sum(Governor == "Democratic"),
+            rep_governor = sum(Governor == "Republican"))
+party_strength
+party_strength %>% pivot_longer(everything(), names_to = "category", values_to = "count") %>% 
+  mutate(party = if_else(str_starts(category, "dem"), "Democrat", "Republican")) %>% 
+  ggplot(aes(x = category, y = count, fill = party)) +
+  geom_col() +
+  scale_fill_manual(values = c("Democrat" = "blue", "Republican" = "red"))
+```
+  
+As we can see from these bar charts, the top 10 states in terms of deaths per 100,000 people tended to vote Republican for recent presidential and gubernatorial elections, and that there exists some sort of positive correlation between generally Republican-voting states and a higher likelihood of negative outcomes in terms of COVID-19. While some may think this correlation is obvious based on their personal experiences these last few years and with the ongoing news coverage surrounding COVID-19, being able to pull the data and create visualizations that can either begin to confirm or challenge those conclusions can help to guide further research and ultimately shape future policy to strive for better outcomes when faced with these sort of challenges like COVID-19.
+  
+### Minnesota
+Now, I'd like to look at some of the data for my home state of Minnesota. Let's look at the 7-day averages for cases and deaths.
+```{r}
+mn <- state_data %>% 
+  filter(state == "Minnesota") %>% 
+  group_by(date, state, state_pop_est) %>% 
+  summarise(cases = sum(cases),
+            deaths = sum(deaths),
+            .groups = "drop") %>% 
+  mutate(delta_cases_1 = cases - lag(cases),
+         delta_deaths_1 = deaths - lag(deaths),
+         delta_cases_7 = round((delta_cases_1 + lag(delta_cases_1, 1) + lag(delta_cases_1, 2) + lag(delta_cases_1, 3) + lag(delta_cases_1, 4) + lag(delta_cases_1, 5) + lag(delta_cases_1, 6)) / 7, 3),
+         delta_deaths_7 = round((delta_deaths_1 + lag(delta_deaths_1, 1) + lag(delta_deaths_1, 2) + lag(delta_deaths_1, 3) + lag(delta_deaths_1, 4) + lag(delta_deaths_1, 5) + lag(delta_deaths_1, 6)) / 7, 3))
+
+mn %>% ggplot(aes(x = date, y = delta_cases_7, color = delta_cases_7)) +
+  geom_line()
+mn %>% ggplot(aes(x = date, y = delta_deaths_7, color = delta_deaths_7)) +
+  geom_line()
+```
+  
+Looking at the two spikes in 7-day average cases near the end of 2020 and the beginning of 2022 and comparing those time periods that correspond in the 7-day average deaths chart, I see that there was a relatively large spike in deaths following the 2020 spike in 7-day average cases. However, the spike in 7-day average cases at the beginning of 2022 was relatively larger than the spike at the end of 2020, but had a significantly smaller spike in 7-day average deaths compared to the spike in deaths at the end of 2020. My intuition tells me that Minnesota was better prepared for the 2022 spike, which resulted in relatively fewer deaths. It may be worth doing further research to discover what exactly Minnesota did to become better prepared.
+
+```{r}
+mn <- state_data %>% 
+  filter(state == "Minnesota" & date == max(date)) %>% 
+  mutate(fips = as.numeric(fips)) %>% 
+  group_by(county, fips, date) %>% 
+  summarise(cases = sum(cases),
+            deaths = sum(deaths),
+            .groups = "drop") %>% 
+  left_join(us_pop_est %>%
+              filter(Year == 2021) %>% 
+              select(fips, Estimate), by = join_by(fips)) %>% 
+  rename(pop_est_2021 = Estimate)
+mn
+
+plot_usmap(regions = "county", include = "MN", data = mn, values = "deaths", color = "blue") +
+  scale_fill_continuous(low = "white", high = "blue", name = "Minnesota Deaths by County") +
+  theme(legend.position = "left")
+
+mn %>% ggplot(aes(x = county, y = cases, fill = county)) +
+  geom_col() +
+  scale_y_continuous(labels = comma) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3))
+
+mn %>% ggplot(aes(x = county, y = deaths, fill = county)) +
+  geom_col() +
+  scale_y_continuous(labels = comma) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3))
+```
+  
+It looks like the more densely populated counties have higher case and death counts, and the less densely populated counties have lower case and death counts. I think that's pretty intuitive, but it's still nice to see it in a chart.
+  
+# COVID-19: World
+Let's now take a look at some global COVID-19 data. I'd like to first compare the US NYT data to the US Johns Hopkins data.
+```{r}
+jh_us <- johns_hopkins_csse_us_cases %>% 
+  group_by(date) %>% 
+  summarise(cases = sum(cases)) %>% 
+  inner_join(johns_hopkins_csse_us_deaths %>% 
+               group_by(date) %>% 
+               summarise(deaths = sum(deaths)), by = join_by(date))
+
+jh_us
+
+jh_us %>% ggplot(aes(x = date, y = cases, color = "red")) +
+  geom_line() +
+  geom_line(data = by_date, aes(x = date, y = total_cases, color = "blue")) +
+  scale_y_continuous(labels = comma) +
+  theme(legend.position = "none")
+
+jh_us %>% ggplot(aes(x = date, y = deaths, color = "red")) +
+  geom_line() +
+  geom_line(data = by_date, aes(x = date, y = total_deaths, color = "blue")) +
+  scale_y_continuous(labels = comma) +
+  theme(legend.position = "none")
+```
+  
+As we can see from these line charts, the NYT and Johns Hopkins data is generally similar in terms of cases and deaths over time. Any discrepancies could likely be attributed to a combination of data collection technique, unreported, underreported, or overreported cases and/or deaths, and/or errors in data entry.
+  
+Finally, I'd like to get a quick overview of global COVID-19 case and death rates. In order to do this, I'll have to first do some more tidying of the data. 
+```{r}
+global_pop_est <- global_pop_est %>% 
+  pivot_longer(matches("\\d"), names_to = "year", names_pattern = "^(....).*", values_to = "population") %>% 
+  mutate(year = as.integer(year), population = as.numeric(population)) %>% 
+  filter(year == 2021)
+
+overview <- johns_hopkins_csse_global_joined %>% 
+  mutate(Country_Region = case_when(`Country/Region` == "Congo (Brazzaville)" ~ "Congo, Dem. Rep.",
+                                    `Country/Region` == "Congo (Kinshasa)" ~ "Congo, Rep.",
+                                    `Country/Region` == "Bahamas" ~ "Bahamas, The",
+                                    `Country/Region` == "Brunei" ~ "Brunei Darussalam",
+                                    `Country/Region` == "Burma" ~ "Myanmar",
+                                    `Country/Region` == "Czechia" ~ "Czech Republic",
+                                    `Country/Region` == "Egypt" ~ "Egypt, Arab Rep.",
+                                    `Country/Region` == "Gambia" ~ "Gambia, The",
+                                    `Country/Region` == "Iran" ~ "Iran, Islamic Rep.",
+                                    `Country/Region` == "Korea, North" ~ "Korea, Dem. People's Rep.",
+                                    `Country/Region` == "Korea, South" ~ "Korea, Rep.",
+                                    `Country/Region` == "Kyrgyzstan" ~ "Kyrgyz Republic",
+                                    `Country/Region` == "Laos" ~ "Lao PDR",
+                                    `Country/Region` == "Micronesia" ~ "Micronesia, Fed. Sts.",
+                                    `Country/Region` == "Russia" ~ "Russian Federation",
+                                    `Country/Region` == "Saint Kitts and Nevis" ~ "St. Kitts and Nevis",
+                                    `Country/Region` == "Saint Lucia" ~ "St. Lucia",
+                                    `Country/Region` == "Saint Vincent and the Grenadines" ~ "St. Vincent and the Grenadines",
+                                    `Country/Region` == "Slovakia" ~ "Slovak Republic",
+                                    `Country/Region` == "Syria" ~ "Syrian Arab Republic",
+                                    `Country/Region` == "US" ~ "United States",
+                                    `Country/Region` == "Venezuela" ~ "Venezuela, RB",
+                                    `Country/Region` == "Yemen" ~ "Yemen, Rep.",
+                                    .default = `Country/Region`)) %>% 
+  left_join(global_pop_est %>% select(`Country Name`, year, population), by = join_by(Country_Region == `Country Name`))
+
+overview <- overview %>% 
+  mutate(population = case_when(Country_Region == "Taiwan*" ~ 23570000, # from Wikipedia
+                                .default = population)) %>% 
+  filter(date == max(date)) %>%
+  group_by(Country_Region, population) %>% 
+  summarise(cases = sum(cases),
+            deaths = sum(deaths)) %>% 
+  ungroup() %>% 
+  mutate(cases_100k = round(cases / population * 100000, 3), deaths_100k = round(deaths / population * 100000, 3))
+
+overview
+
+overview %>% arrange(desc(cases_100k)) %>% head(10) %>% ggplot(aes(x = reorder(Country_Region, -cases_100k), y = cases_100k, fill = Country_Region)) +
+  geom_col(stat = "identity") +
+  labs(x = "Country/Region") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 50, hjust = 1))
+
+overview %>% arrange(desc(deaths_100k)) %>% head(10) %>% ggplot(aes(x = reorder(Country_Region, -deaths_100k), y = deaths_100k, fill = Country_Region)) +
+  geom_col(stat = "identity") +
+  labs(x = "Country/Region") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 50, hjust = 1))
+```
+  
+It looks like Peru has the highest COVID-19 death rate, which seems surprising at first glance. However, with a little more research on the internet, one can discover that Peru's healthcare system is pretty abysmal compared to the rest of the world.
+  
+# Conclusion
+The COVID-19 pandemic put a lot of strain on the world and disproportionately affected certain areas more than other areas due to a number of socioeconomic factors, including but not limited to local, state, and country-level government policy, existing issues in a given area's healthcare system, and funding available in a given area. There may exist some bias in the data sets I used here, as it is possible that COVID-19 cases may have been underreported or overreported, either willfully or negligently, in some areas of the world. There is much more research that could be done, as I have only scratched the surface in this analysis.
+
+```{r include=FALSE}
+sessionInfo()
+```
+
